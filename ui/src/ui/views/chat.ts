@@ -1160,6 +1160,26 @@ export function renderChat(props: ChatProps) {
                 canvasHostUrl: props.canvasHostUrl,
                 embedSandboxMode: props.embedSandboxMode ?? "scripts",
                 allowExternalEmbedUrls: props.allowExternalEmbedUrls ?? false,
+                onUiAction:
+                  normalizeRoleForGrouping(item.role) !== "user"
+                    ? (payload: unknown) => {
+                        const messageText =
+                          typeof payload === "string"
+                            ? payload
+                            : (() => {
+                                try {
+                                  return JSON.stringify(payload) ?? "";
+                                } catch {
+                                  return String(payload ?? "");
+                                }
+                              })();
+                        if (!messageText.trim()) {
+                          return;
+                        }
+                        props.onDraftChange(messageText);
+                        props.onSend();
+                      }
+                    : undefined,
                 contextWindow:
                   activeSession?.contextTokens ?? props.sessions?.defaults?.contextTokens ?? null,
                 onDelete: () => {

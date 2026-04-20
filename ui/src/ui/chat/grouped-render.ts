@@ -1,3 +1,5 @@
+import "../components/interactive-card.ts";
+
 import { html, nothing } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import { getSafeLocalStorage } from "../../local-storage.ts";
@@ -255,6 +257,7 @@ export function renderMessageGroup(
     canvasHostUrl?: string | null;
     embedSandboxMode?: EmbedSandboxMode;
     allowExternalEmbedUrls?: boolean;
+    onUiAction?: (payload: any) => void;
     contextWindow?: number | null;
     onDelete?: () => void;
   },
@@ -316,6 +319,7 @@ export function renderMessageGroup(
               localMediaPreviewRoots: opts.localMediaPreviewRoots,
               assistantAttachmentAuthToken: opts.assistantAttachmentAuthToken,
               embedSandboxMode: opts.embedSandboxMode,
+              onUiAction: opts.onUiAction,
             },
             opts.onOpenSidebar,
           ),
@@ -1112,6 +1116,138 @@ function detectJson(text: string): { parsed: unknown; pretty: string } | null {
   return null;
 }
 
+function toRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function isInteractiveCardSchema(value: unknown): value is Record<string, unknown> {
+  const record = toRecord(value);
+  if (!record) {
+    return false;
+  }
+  const meta = toRecord(record.meta);
+  if (!meta) {
+    return false;
+  }
+  return (
+    typeof meta.task_id === "string" &&
+    typeof meta.title === "string" &&
+    Array.isArray(record.elements) &&
+    Array.isArray(record.actions)
+  );
+}
+
+function resolveInteractiveCardSchema(parsed: unknown): Record<string, unknown> | null {
+  const root = toRecord(parsed);
+  if (!root) {
+    return null;
+  }
+
+  const directType = root.ui_type ?? root.uiType ?? root.type ?? root.kind;
+  if (directType === "interactive_card" && isInteractiveCardSchema(root)) {
+    return root;
+  }
+  if (isInteractiveCardSchema(root) && (directType === undefined || directType === null)) {
+    return root;
+  }
+
+  const nestedCandidates: unknown[] = [root.schema, root.card, root.payload, root.data];
+  for (const candidate of nestedCandidates) {
+    const resolved = isInteractiveCardSchema(candidate)
+      ? candidate
+      : resolveInteractiveCardSchema(candidate);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  // MCP envelope: { content: [{ type: "text", text: "{...interactive schema...}" }] }
+  const content = root.content;
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      const contentItem = toRecord(item);
+      if (!contentItem) {
+        continue;
+      }
+      const text = contentItem.text;
+      if (typeof text !== "string") {
+        continue;
+      }
+      const innerParsed = parseJsonCandidate(text);
+      if (!innerParsed) {
+        continue;
+      }
+      const resolved = resolveInteractiveCardSchema(innerParsed);
+      if (resolved) {
+        return resolved;
+      }
+    }
+  }
+
+  if (Array.isArray(parsed) && parsed.length === 1 && isInteractiveCardSchema(parsed[0])) {
+    return parsed[0];
+  }
+
+  return null;
+}
+
+function parseJsonCandidate(candidate: string): unknown | null {
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.length > MAX_JSON_AUTOPARSE_CHARS) {
+    return null;
+  }
+  if (
+    !((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]")))
+  ) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function detectEmbeddedInteractiveCardSchema(text: string): Record<string, unknown> | null {
+  const candidates = new Set<string>();
+  candidates.add(text.trim());
+
+  // Prefer fenced code blocks when the message is mixed markdown + JSON.
+  const codeBlockPattern = /```(?:json)?\s*([\s\S]*?)```/gi;
+  for (const match of text.matchAll(codeBlockPattern)) {
+    const content = match[1]?.trim();
+    if (content) {
+      candidates.add(content);
+    }
+  }
+
+  // Fallback: try the widest object-like slice in mixed text.
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.add(text.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    const parsed = parseJsonCandidate(candidate);
+    if (!parsed) {
+      continue;
+    }
+    const schema = resolveInteractiveCardSchema(parsed);
+    if (schema) {
+      return schema;
+    }
+  }
+
+  return null;
+}
+
 /** Build a short summary label for collapsed JSON (type + key count or array length). */
 function jsonSummaryLabel(parsed: unknown): string {
   if (Array.isArray(parsed)) {
@@ -1160,6 +1296,7 @@ function renderGroupedMessage(
     assistantAttachmentAuthToken?: string | null;
     embedSandboxMode?: EmbedSandboxMode;
     allowExternalEmbedUrls?: boolean;
+    onUiAction?: (payload: any) => void;
   },
   onOpenSidebar?: (content: SidebarContent) => void,
 ) {
@@ -1186,7 +1323,9 @@ function renderGroupedMessage(
   const normalizedMessage = normalizeMessage(message);
   const extractedText = normalizedMessage.content
     .reduce<string[]>((lines, item) => {
-      if (item.type === "text" && typeof item.text === "string") {
+      const isTextLikeItem = "text" in item;
+      const isToolBlock = item.type === "tool_call" || item.type === "tool_result";
+      if (isTextLikeItem && !isToolBlock && typeof item.text === "string") {
         lines.push(item.text);
       }
       return lines;
@@ -1203,6 +1342,9 @@ function renderGroupedMessage(
   const extractedThinking =
     opts.showReasoning && role === "assistant" ? extractThinkingCached(message) : null;
   const markdownBase = extractedText?.trim() ? extractedText : null;
+  if (markdownBase && markdownBase.startsWith("[SYSTEM_UI_RETURN]")) {
+    return nothing;
+  }
   const reasoningMarkdown = extractedThinking ? formatReasoningMarkdown(extractedThinking) : null;
   const markdown = markdownBase;
   const canCopyMarkdown = role === "assistant" && Boolean(markdown?.trim());
@@ -1210,6 +1352,9 @@ function renderGroupedMessage(
 
   // Detect pure-JSON messages and render as collapsible block
   const jsonResult = markdown && !opts.isStreaming ? detectJson(markdown) : null;
+  const interactiveCardSchema =
+    (jsonResult ? resolveInteractiveCardSchema(jsonResult.parsed) : null) ??
+    (markdown && !opts.isStreaming ? detectEmbeddedInteractiveCardSchema(markdown) : null);
 
   const bubbleClasses = ["chat-bubble", opts.isStreaming ? "streaming" : "", "fade-in"]
     .filter(Boolean)
@@ -1229,8 +1374,13 @@ function renderGroupedMessage(
   }
 
   const isToolMessage = normalizedRole === "tool" || isToolResult;
+  const canRenderInteractiveCard =
+    normalizedRole !== "user" && Boolean(interactiveCardSchema);
   const toolMessageDisclosureId = `toolmsg:${messageKey}`;
-  const toolMessageExpanded = opts.isToolMessageExpanded?.(toolMessageDisclosureId) ?? false;
+  const toolMessageExpanded =
+    isToolMessage && canRenderInteractiveCard
+      ? true
+      : (opts.isToolMessageExpanded?.(toolMessageDisclosureId) ?? false);
   const toolNames = [...new Set(toolCards.map((c) => c.name))];
   const toolSummaryLabel =
     toolNames.length <= 3
@@ -1294,24 +1444,31 @@ function renderGroupedMessage(
                             ${unsafeHTML(toSanitizedMarkdownHtml(reasoningMarkdown))}
                           </div>`
                         : nothing}
-                      ${jsonResult
-                        ? html`<details
-                            class="chat-json-collapse"
-                            ?open=${Boolean(opts.autoExpandToolCalls)}
-                          >
-                            <summary class="chat-json-summary">
-                              <span class="chat-json-badge">JSON</span>
-                              <span class="chat-json-label"
-                                >${jsonSummaryLabel(jsonResult.parsed)}</span
-                              >
-                            </summary>
-                            <pre class="chat-json-content"><code>${jsonResult.pretty}</code></pre>
-                          </details>`
-                        : markdown
-                          ? html`<div class="chat-text" dir="${detectTextDirection(markdown)}">
-                              ${unsafeHTML(toSanitizedMarkdownHtml(markdown))}
-                            </div>`
-                          : nothing}
+                      ${canRenderInteractiveCard
+                        ? html`
+                            <interactive-card
+                              .schema=${interactiveCardSchema}
+                              @ui-action=${(e: CustomEvent) => opts.onUiAction?.(e.detail)}
+                            ></interactive-card>
+                          `
+                        : jsonResult
+                          ? html`<details
+                              class="chat-json-collapse"
+                              ?open=${Boolean(opts.autoExpandToolCalls)}
+                            >
+                              <summary class="chat-json-summary">
+                                <span class="chat-json-badge">JSON</span>
+                                <span class="chat-json-label"
+                                  >${jsonSummaryLabel(jsonResult.parsed)}</span
+                                >
+                              </summary>
+                              <pre class="chat-json-content"><code>${jsonResult.pretty}</code></pre>
+                            </details>`
+                          : markdown
+                            ? html`<div class="chat-text" dir="${detectTextDirection(markdown)}">
+                                ${unsafeHTML(toSanitizedMarkdownHtml(markdown))}
+                              </div>`
+                            : nothing}
                       ${hasToolCards
                         ? singleToolCard && !markdown && !hasImages
                           ? renderExpandedToolCardContent(
@@ -1361,19 +1518,26 @@ function renderGroupedMessage(
                   ${block.rawText ? renderRawOutputToggle(block.rawText) : nothing}`,
                 )}`
               : nothing}
-            ${jsonResult
-              ? html`<details class="chat-json-collapse">
-                  <summary class="chat-json-summary">
-                    <span class="chat-json-badge">JSON</span>
-                    <span class="chat-json-label">${jsonSummaryLabel(jsonResult.parsed)}</span>
-                  </summary>
-                  <pre class="chat-json-content"><code>${jsonResult.pretty}</code></pre>
-                </details>`
-              : markdown
-                ? html`<div class="chat-text" dir="${detectTextDirection(markdown)}">
-                    ${unsafeHTML(toSanitizedMarkdownHtml(markdown))}
-                  </div>`
-                : nothing}
+            ${canRenderInteractiveCard
+              ? html`
+                  <interactive-card
+                    .schema=${interactiveCardSchema}
+                    @ui-action=${(e: CustomEvent) => opts.onUiAction?.(e.detail)}
+                  ></interactive-card>
+                `
+              : jsonResult
+                ? html`<details class="chat-json-collapse">
+                    <summary class="chat-json-summary">
+                      <span class="chat-json-badge">JSON</span>
+                      <span class="chat-json-label">${jsonSummaryLabel(jsonResult.parsed)}</span>
+                    </summary>
+                    <pre class="chat-json-content"><code>${jsonResult.pretty}</code></pre>
+                  </details>`
+                : markdown
+                  ? html`<div class="chat-text" dir="${detectTextDirection(markdown)}">
+                      ${unsafeHTML(toSanitizedMarkdownHtml(markdown))}
+                    </div>`
+                  : nothing}
             ${hasToolCards
               ? renderInlineToolCards(toolCards, {
                   messageKey,
